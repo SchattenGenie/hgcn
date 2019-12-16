@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn.modules.module import Module
 from torch.nn.parameter import Parameter
-
+from torch_geometric.utils import scatter_
 from layers.att_layers import DenseAtt
 
 
@@ -62,18 +62,38 @@ class HyperbolicGraphConvolution(nn.Module):
     Hyperbolic graph convolution layer.
     """
 
-    def __init__(self, manifold, in_features, out_features, c_in, c_out, dropout, act, use_bias, use_att):
+    def __init__(self, manifold, in_features, out_features, c_in, c_out, dropout, act, use_bias, use_att, agg_direction):
         super(HyperbolicGraphConvolution, self).__init__()
         self.linear = HypLinear(manifold, in_features, out_features, c_in, dropout, use_bias)
-        self.agg = HypAgg(manifold, c_in, use_att, out_features, dropout)
+        self.agg = HypAgg(manifold, c_in, use_att, out_features, dropout, agg_direction)
         self.hyp_act = HypAct(manifold, c_in, c_out, act)
 
     def forward(self, input):
-        x, adj = input
+        x, adj, *_ = input
         h = self.linear.forward(x)
         h = self.agg.forward(h, adj)
         h = self.hyp_act.forward(h)
         output = h, adj
+        return output
+    
+    
+class HyperbolicEmulsionConvolution(nn.Module):
+    def __init__(self, manifold, in_features, out_features, c_in, c_out, dropout, act, use_bias, use_att, agg_direction):
+        super(HyperbolicEmulsionConvolution, self).__init__()
+        self.manifold = manifold
+        self.linear = HypLinear(manifold, in_features, out_features, c_in, dropout, use_bias)
+        self.agg = HypAgg(manifold, c_in, use_att, out_features, dropout, agg_direction)
+        self.hyp_act = HypAct(manifold, c_in, c_out, act)
+        self.c_out = c_out
+
+    def forward(self, input):
+        x, adj, orders, *_ = input
+        h = self.linear.forward(x)
+        for order in orders:
+            h = self.manifold.mobius_add(h, self.agg.forward(h, adj[:, order]), c=self.c_out)
+            # h = h + self.agg.forward(h, adj[:, order])
+        h = self.hyp_act.forward(h)
+        output = h, adj, orders
         return output
 
 
@@ -121,13 +141,18 @@ class HypAgg(Module):
     """
     Hyperbolic aggregation layer.
     """
-
-    def __init__(self, manifold, c, use_att, in_features, dropout):
+    # TODO: bi directional
+    def __init__(self, manifold, c, use_att, in_features, dropout, agg_direction='in'):
         super(HypAgg, self).__init__()
         self.manifold = manifold
         self.c = c
         self.use_att = use_att
-
+        if agg_direction == 'in':
+            self.i = 0
+        elif agg_direction == 'out':
+            self.i = 1
+        else:
+            RaiseError("Nononono")
         self.in_features = in_features
         self.dropout = dropout
         if use_att:
@@ -137,8 +162,8 @@ class HypAgg(Module):
         x_tangent = self.manifold.logmap0(x, c=self.c)
         if self.use_att:
             # TODO : merge in sparse att layer
-            adj = self.att(x_tangent, adj)
-        support_t = torch.spmm(adj, x_tangent)
+            adj_att = self.att(x_tangent, adj)
+        support_t = scatter_('add', x_tangent[adj[self.i]] * adj_att, adj[self.i], dim=0, dim_size=len(x))
         output = self.manifold.proj(self.manifold.expmap0(support_t, c=self.c), c=self.c)
         return output
 
