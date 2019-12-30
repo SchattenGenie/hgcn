@@ -13,8 +13,8 @@ import optimizers
 import torch
 from config import parser
 from models.base_models import NCModel, LPModel
-from utils.data_utils import load_data
-from utils.train_utils import get_dir_name, format_metrics
+from viz_utils.data_utils import load_data
+from viz_utils.train_utils import get_dir_name, format_metrics
 
 
 def train(args):

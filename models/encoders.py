@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import utils.math_utils as pmath
+import viz_utils.math_utils as pmath
 from layers.att_layers import GraphAttentionLayer
 from layers.layers import GraphConvolution, Linear, get_dim_act
 

@@ -8,7 +8,7 @@ import layers.hyp_layers as hyp_layers
 from models.decoders import model2decoder
 from layers.layers import FermiDiracDecoder
 from sklearn.metrics import roc_auc_score, average_precision_score
-from utils.eval_utils import acc_f1
+from viz_utils.eval_utils import acc_f1
 
 
 class BaseModel(nn.Module):
