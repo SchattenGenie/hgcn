@@ -1,6 +1,5 @@
 """Hyperbolic layers."""
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,6 +8,8 @@ from torch.nn.modules.module import Module
 from torch.nn.parameter import Parameter
 from torch_geometric.utils import scatter_
 from layers.att_layers import DenseAtt
+from utils.math_utils import artanh, tanh
+import numpy as np
 
 
 def get_dim_act_curv(args):
@@ -40,7 +41,6 @@ def get_dim_act_curv(args):
     return dims, acts, curvatures
 
 
-
 class HNNLayer(nn.Module):
     """
     Hyperbolic neural networks layer.
@@ -62,39 +62,90 @@ class HyperbolicGraphConvolution(nn.Module):
     Hyperbolic graph convolution layer.
     """
 
-    def __init__(self, manifold, in_features, out_features, c_in, c_out, dropout, act, use_bias, use_att, agg_direction):
+    def __init__(self, manifold, in_features, out_features, c_in, c_out, edge_dim, dropout, act, use_bias, use_att, agg_direction):
         super(HyperbolicGraphConvolution, self).__init__()
-        self.linear = HypLinear(manifold, in_features, out_features, c_in, dropout, use_bias)
-        self.agg = HypAgg(manifold, c_in, use_att, out_features, dropout, agg_direction)
-        self.hyp_act = HypAct(manifold, c_in, c_out, act)
-
-    def forward(self, input):
-        x, adj, *_ = input
-        h = self.linear.forward(x)
-        h = self.agg.forward(h, adj)
-        h = self.hyp_act.forward(h)
-        output = h, adj
-        return output
-    
-    
-class HyperbolicEmulsionConvolution(nn.Module):
-    def __init__(self, manifold, in_features, out_features, c_in, c_out, dropout, act, use_bias, use_att, agg_direction):
-        super(HyperbolicEmulsionConvolution, self).__init__()
         self.manifold = manifold
         self.linear = HypLinear(manifold, in_features, out_features, c_in, dropout, use_bias)
-        self.agg = HypAgg(manifold, c_in, use_att, out_features, dropout, agg_direction)
+        self.agg = HypAgg(manifold, c_in, use_att, out_features, dropout, agg_direction, edge_dim=edge_dim)
         self.hyp_act = HypAct(manifold, c_in, c_out, act)
         self.c_out = c_out
 
-    def forward(self, input):
-        x, adj, orders, *_ = input
+    def forward(self, x, adj, edge_attr, **kwargs):
+        # x, adj, *_ = input
+        h = self.linear.forward(x)
+        h = self.agg.forward(h, adj, edge_attr)
+        h = self.hyp_act.forward(h)
+        return h
+    
+
+def extract_subgraph(h, adj, edge_attr, order):
+    adj_selected = adj[:, order]
+    edge_attr_selected = edge_attr[order, :]
+    nodes_selected = adj_selected.unique()
+    h_selected = h[nodes_selected]
+    nodes_selected_new = torch.arange(len(nodes_selected))
+    dictionary = dict(zip(nodes_selected.cpu().numpy(), nodes_selected_new.cpu().numpy()))
+    adj_selected_new = torch.tensor(np.vectorize(dictionary.get)(adj_selected.cpu().numpy())).long().to(adj)
+    return h_selected, nodes_selected, edge_attr_selected, adj_selected_new
+
+
+def mid_point_poincare(x, y, c, manifold):
+    sqrt_c = c ** 0.5
+    r = 0.5
+
+    x_y = manifold.mobius_add(-x, y, c=c)
+    norm = torch.clamp_min(x_y.norm(dim=-1, keepdim=True, p=2), 1e-15)
+    x_y_r = tanh(r * artanh(sqrt_c * norm)) * (x_y / norm) / sqrt_c
+    mid_point = manifold.mobius_add(x, x_y_r, c=c)
+    return mid_point
+
+
+class HyperbolicEmulsionConvolution(nn.Module):
+    def __init__(self, manifold, in_features, out_features, c_in, c_out, dropout, act, use_bias, use_att, agg_direction, edge_dim):
+        super(HyperbolicEmulsionConvolution, self).__init__()
+        self.manifold = manifold
+        self.linear = HypLinear(manifold, in_features, out_features, c_in, dropout, use_bias)
+        self.agg = HypAgg(manifold, c_in, use_att, out_features, dropout, agg_direction, edge_dim=edge_dim)
+        self.hyp_act = HypAct(manifold, c_in, c_out, act)
+        self.c_out = c_out
+
+    def forward(self, x, adj, edge_attr, orders):
+        # x, adj, orders, *_ = input
         h = self.linear.forward(x)
         for order in orders:
-            h = self.manifold.mobius_add(h, self.agg.forward(h, adj[:, order]), c=self.c_out)
-            # h = h + self.agg.forward(h, adj[:, order])
+            # print(order.shape, order.sum())
+            if order.sum():
+                h_selected, nodes_selected, edge_attr_selected, adj_selected_new = extract_subgraph(
+                    h,
+                    adj,
+                    edge_attr,
+                    order=order
+                )
+                """
+                h[nodes_selected] = self.manifold.proj(
+                    self.manifold.mobius_add(
+                        h[nodes_selected],
+                        self.agg.forward(h[nodes_selected], adj_selected_new, edge_attr_selected),
+                        c=self.c_out
+                    ),
+                    c=self.c_out
+                )
+                """
+                h[nodes_selected] = self.manifold.proj(
+                    mid_point_poincare(
+                        h[nodes_selected],
+                        self.agg.forward(h[nodes_selected], adj_selected_new, edge_attr_selected),
+                        c=self.c_out,
+                        manifold=self.manifold
+                    ),
+                    c=self.c_out
+                )
+                # print(h)
+                # TODO: average?
+                # h = h + self.agg.forward(h, adj[:, order])
         h = self.hyp_act.forward(h)
-        output = h, adj, orders
-        return output
+        # output = h, adj, orders
+        return h
 
 
 class HypLinear(nn.Module):
@@ -142,7 +193,7 @@ class HypAgg(Module):
     Hyperbolic aggregation layer.
     """
     # TODO: bi directional
-    def __init__(self, manifold, c, use_att, in_features, dropout, agg_direction='in'):
+    def __init__(self, manifold, c, use_att, in_features, dropout, agg_direction='in', edge_dim=0):
         super(HypAgg, self).__init__()
         self.manifold = manifold
         self.c = c
@@ -156,14 +207,20 @@ class HypAgg(Module):
         self.in_features = in_features
         self.dropout = dropout
         if use_att:
-            self.att = DenseAtt(in_features, dropout, lambda x: x)
+            print(edge_dim)
+            self.att = DenseAtt(2 * in_features + edge_dim, dropout, lambda x: x)
 
-    def forward(self, x, adj):
+    def forward(self, x, adj, edge_attr):
         x_tangent = self.manifold.logmap0(x, c=self.c)
         if self.use_att:
             # TODO : merge in sparse att layer
-            adj_att = self.att(x_tangent, adj)
-        support_t = scatter_('add', x_tangent[adj[self.i]] * adj_att, adj[self.i], dim=0, dim_size=len(x))
+            adj_att = self.att(x_tangent, adj, edge_attr)
+        support_t = (
+                x_tangent +
+                scatter_('add', x_tangent[adj[self.i]] * adj_att, adj[self.i], dim=0, dim_size=len(x)) +
+                scatter_('mean', edge_attr, adj[self.i], dim=0, dim_size=len(x)) +
+                scatter_('mean', edge_attr, adj[1 - self.i], dim=0, dim_size=len(x))
+                    )
         output = self.manifold.proj(self.manifold.expmap0(support_t, c=self.c), c=self.c)
         return output
 
