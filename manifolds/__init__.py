@@ -1,3 +1,3 @@
 from .base import ManifoldParameter
 from .euclidean import Euclidean
-from .poincare import PoincareBall
+from .poincare import PoincareBall, Curvature

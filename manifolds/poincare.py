@@ -1,7 +1,18 @@
 import torch
+from torch.nn import Softplus
 from manifolds.base import Manifold
 from torch.autograd import Function
 from utils.math_utils import artanh, tanh
+
+
+class Curvature:
+    def __init__(self, raw_c):
+        self.raw_c = raw_c
+        self.softplus = Softplus()
+
+    @property
+    def c(self):
+        return self.softplus(self.raw_c)
 
 
 class PoincareBall(Manifold):
@@ -20,38 +31,38 @@ class PoincareBall(Manifold):
         self.min_norm = 1e-15
         self.eps = {torch.float32: 4e-3, torch.float64: 1e-5}
 
-    def sqdist(self, p1, p2, c):
-        sqrt_c = c ** 0.5
+    def sqdist(self, p1, p2, c: Curvature):
+        sqrt_c = c.c ** 0.5
         dist_c = artanh(
             sqrt_c * self.mobius_add(-p1, p2, c, dim=-1).norm(dim=-1, p=2, keepdim=False)
         )
         dist = dist_c * 2 / sqrt_c
         return dist ** 2
 
-    def _lambda_x(self, x, c):
+    def _lambda_x(self, x, c: Curvature):
         x_sqnorm = torch.sum(x.data.pow(2), dim=-1, keepdim=True)
-        return 2 / (1. - c * x_sqnorm).clamp_min(self.min_norm)
+        return 2 / (1. - c.c * x_sqnorm).clamp_min(self.min_norm)
 
-    def egrad2rgrad(self, p, dp, c):
+    def egrad2rgrad(self, p, dp, c: Curvature):
         lambda_p = self._lambda_x(p, c)
         dp /= lambda_p.pow(2)
         return dp
 
-    def proj(self, x, c):
+    def proj(self, x, c: Curvature):
         norm = torch.clamp_min(x.norm(dim=-1, keepdim=True, p=2), self.min_norm)
-        maxnorm = (1 - self.eps[x.dtype]) / (c ** 0.5)
+        maxnorm = (1 - self.eps[x.dtype]) / (c.c ** 0.5)
         cond = norm > maxnorm
         projected = x / norm * maxnorm
         return torch.where(cond, projected, x)
 
-    def proj_tan(self, u, p, c):
+    def proj_tan(self, u, p, c: Curvature):
         return u
 
-    def proj_tan0(self, u, c):
+    def proj_tan0(self, u, c: Curvature):
         return u
 
-    def expmap(self, u, p, c):
-        sqrt_c = c ** 0.5
+    def expmap(self, u, p, c: Curvature):
+        sqrt_c = c.c ** 0.5
         u_norm = u.norm(dim=-1, p=2, keepdim=True).clamp_min(self.min_norm)
         second_term = (
                 tanh(sqrt_c / 2 * self._lambda_x(p, c) * u_norm)
@@ -61,35 +72,35 @@ class PoincareBall(Manifold):
         gamma_1 = self.mobius_add(p, second_term, c)
         return gamma_1
 
-    def logmap(self, p1, p2, c):
+    def logmap(self, p1, p2, c: Curvature):
         sub = self.mobius_add(-p1, p2, c)
         sub_norm = sub.norm(dim=-1, p=2, keepdim=True).clamp_min(self.min_norm)
         lam = self._lambda_x(p1, c)
-        sqrt_c = c ** 0.5
+        sqrt_c = c.c ** 0.5
         return 2 / sqrt_c / lam * artanh(sqrt_c * sub_norm) * sub / sub_norm
 
-    def expmap0(self, u, c):
-        sqrt_c = c ** 0.5
+    def expmap0(self, u, c: Curvature):
+        sqrt_c = c.c ** 0.5
         u_norm = torch.clamp_min(u.norm(dim=-1, p=2, keepdim=True), self.min_norm)
         gamma_1 = tanh(sqrt_c * u_norm) * u / (sqrt_c * u_norm)
         return gamma_1
 
-    def logmap0(self, p, c):
-        sqrt_c = c ** 0.5
+    def logmap0(self, p, c: Curvature):
+        sqrt_c = c.c ** 0.5
         p_norm = p.norm(dim=-1, p=2, keepdim=True).clamp_min(self.min_norm)
         scale = 1. / sqrt_c * artanh(sqrt_c * p_norm) / p_norm
         return scale * p
 
-    def mobius_add(self, x, y, c, dim=-1):
+    def mobius_add(self, x, y, c: Curvature, dim=-1):
         x2 = x.pow(2).sum(dim=dim, keepdim=True)
         y2 = y.pow(2).sum(dim=dim, keepdim=True)
         xy = (x * y).sum(dim=dim, keepdim=True)
-        num = (1 + 2 * c * xy + c * y2) * x + (1 - c * x2) * y
-        denom = 1 + 2 * c * xy + c ** 2 * x2 * y2
+        num = (1 + 2 * c.c * xy + c.c * y2) * x + (1 - c.c * x2) * y
+        denom = 1 + 2 * c.c * xy + c.c ** 2 * x2 * y2
         return num / denom.clamp_min(self.min_norm)
 
-    def mobius_matvec(self, m, x, c):
-        sqrt_c = c ** 0.5
+    def mobius_matvec(self, m, x, c: Curvature):
+        sqrt_c = c.c ** 0.5
         x_norm = x.norm(dim=-1, keepdim=True, p=2).clamp_min(self.min_norm)
         mx = x @ m.transpose(-1, -2)
         mx_norm = mx.norm(dim=-1, keepdim=True, p=2).clamp_min(self.min_norm)
@@ -109,19 +120,28 @@ class PoincareBall(Manifold):
         uv = (u * v).sum(dim=dim, keepdim=True)
         uw = (u * w).sum(dim=dim, keepdim=True)
         vw = (v * w).sum(dim=dim, keepdim=True)
-        c2 = c ** 2
-        a = -c2 * uw * v2 + c * vw + 2 * c2 * uv * vw
-        b = -c2 * vw * u2 - c * uw
+        c2 = c.c ** 2
+        a = -c2 * uw * v2 + c.c * vw + 2 * c2 * uv * vw
+        b = -c2 * vw * u2 - c.c * uw
         d = 1 + 2 * c * uv + c2 * u2 * v2
         return w + 2 * (a * u + b * v) / d.clamp_min(self.min_norm)
 
-    def inner(self, x, c, u, v=None, keepdim=False, dim=-1):
+    def inner(self, x, c, u: Curvature, v=None, keepdim=False, dim=-1):
         if v is None:
             v = u
         lambda_x = self._lambda_x(x, c)
         return lambda_x ** 2 * (u * v).sum(dim=dim, keepdim=keepdim)
 
-    def ptransp(self, x, y, u, c):
+    def ptransp(self, x, y, u, c: Curvature):
         lambda_x = self._lambda_x(x, c)
         lambda_y = self._lambda_x(y, c)
         return self._gyration(y, -x, u, c) * lambda_x / lambda_y
+
+    def mid_point_poincare(self, x, y, c: Curvature, manifold):
+        sqrt_c = c.c ** 0.5
+        r = 0.5
+        x_y = manifold.mobius_add(-x, y, c=c)
+        norm = torch.clamp_min(x_y.norm(dim=-1, keepdim=True, p=2), 1e-15)
+        x_y_r = tanh(r * artanh(sqrt_c * norm)) * (x_y / norm) / sqrt_c
+        mid_point = manifold.mobius_add(x, x_y_r, c=c)
+        return mid_point

@@ -7,17 +7,7 @@ import sys
 import layers.hyp_layers as hyp_layers
 from layers.layers import FermiDiracDecoder
 from utils.math_utils import artanh, tanh
-
-
-def mid_point_poincare(x, y, c, manifold):
-    sqrt_c = c ** 0.5
-    r = 0.5
-
-    x_y = manifold.mobius_add(-x, y, c=c)
-    norm = torch.clamp_min(x_y.norm(dim=-1, keepdim=True, p=2), 1e-15)
-    x_y_r = tanh(r * artanh(sqrt_c * norm)) * (x_y / norm) / sqrt_c
-    mid_point = manifold.mobius_add(x, x_y_r, c=c)
-    return mid_point
+from torch.utils.checkpoint import checkpoint
 
 
 def get_dim_act_curv(input_dim, hidden_dim, num_layers=5, act='tanh'):
@@ -34,7 +24,9 @@ def get_dim_act_curv(input_dim, hidden_dim, num_layers=5, act='tanh'):
     dims += [hidden_dim]
     acts += [act]
     n_curvatures = num_layers
-    curvatures = [nn.Parameter(torch.Tensor([1.])) for _ in range(n_curvatures)]
+    curvatures = []
+    for _ in range(n_curvatures):
+        curvatures.append(nn.Parameter(torch.Tensor([1.])))
     return dims, acts, curvatures
 
 
@@ -66,7 +58,7 @@ class HGCN(nn.Module):
         for i, curv in enumerate(curvatures):
             curv = nn.Parameter(curv)
             self.register_parameter("c_{}".format(i), curv)
-            self.curvatures.append(curv)
+            self.curvatures.append(manifolds.Curvature(curv))
         # https://github.com/HazyResearch/hgcn/blob/25a3701f8dfbab2341bc18091fedcb0e9bf61395/models/base_models.py#L27
         hgc_layers = []
         for i in range(len(dims) - 1):
@@ -96,16 +88,25 @@ class HGCN(nn.Module):
         adj = graph.edge_index
         if hasattr(graph, 'edge_attr'):
             edge_attr = graph.edge_attr
+            edge_attr = self.manifold.proj(
+                    self.manifold.expmap0(self.manifold.proj_tan0(edge_attr, self.curvatures[0]), c=self.curvatures[0]),
+                    c=self.curvatures[0]
+            )
         else:
             edge_attr = None
-        # initial transformation to manifgold
+        # initial transformation to manifold
         x_hyp = self.manifold.proj(
                 self.manifold.expmap0(self.manifold.proj_tan0(x, self.curvatures[0]), c=self.curvatures[0]),
                 c=self.curvatures[0]
         )
         if self.encode_graph:
-            for layer in self.layers:
-                x_hyp = layer.forward(x=x_hyp, adj=adj, edge_attr=edge_attr)
+            for i, layer in enumerate(self.layers):
+                # x_hyp = layer.forward(x=x_hyp, adj=adj, edge_attr=edge_attr)
+                x_hyp = checkpoint(layer, x_hyp, adj, edge_attr)
+                edge_attr = self.manifold.proj(
+                    self.manifold.expmap0(self.manifold.logmap0(edge_attr, self.curvatures[i]), self.curvatures[i + 1]),
+                    c=self.curvatures[i + 1]
+                )
         else:
             x_hyp = self.layers.forward(x)
         return x_hyp
@@ -139,7 +140,7 @@ class HGCNResidual(nn.Module):
         for i, curv in enumerate(curvatures):
             curv = nn.Parameter(curv)
             self.register_parameter("c_{}".format(i), curv)
-            self.curvatures.append(curv)
+            self.curvatures.append(manifolds.Curvature(curv))
         # https://github.com/HazyResearch/hgcn/blob/25a3701f8dfbab2341bc18091fedcb0e9bf61395/models/base_models.py#L27
         hgc_layers = []
         for i in range(len(dims) - 1):
@@ -169,6 +170,10 @@ class HGCNResidual(nn.Module):
         adj = graph.edge_index
         if hasattr(graph, 'edge_attr'):
             edge_attr = graph.edge_attr
+            edge_attr = self.manifold.proj(
+                    self.manifold.expmap0(self.manifold.proj_tan0(edge_attr, self.curvatures[0]), c=self.curvatures[0]),
+                    c=self.curvatures[0]
+            )
         else:
             edge_attr = None
         # initial transformation to manifold
@@ -177,14 +182,19 @@ class HGCNResidual(nn.Module):
                 c=self.curvatures[0]
         )
         for i, layer in enumerate(self.layers):
-            x_new = layer.forward(x=x_hyp, adj=adj, edge_attr=edge_attr)
+            # x_new = layer.forward(x=x_hyp, adj=adj, edge_attr=edge_attr)
+            x_new = checkpoint(layer, x_hyp, adj, edge_attr)
+            edge_attr = self.manifold.proj(
+                self.manifold.expmap0(self.manifold.logmap0(edge_attr, self.curvatures[i]), self.curvatures[i + 1]),
+                c=self.curvatures[i + 1]
+            )
             if i >= 1:
                 x_hyp_new_curv = self.manifold.proj(
                     self.manifold.expmap0(self.manifold.logmap0(x_hyp, self.curvatures[i]), self.curvatures[i + 1]),
                     c=self.curvatures[i + 1]
                 )
                 x_hyp = self.manifold.proj(
-                    mid_point_poincare(x=x_hyp_new_curv, y=x_new, c=self.curvatures[i + 1], manifold=self.manifold),
+                    self.manifold.mid_point_poincare(x=x_hyp_new_curv, y=x_new, c=self.curvatures[i + 1], manifold=self.manifold),
                     c=self.curvatures[i + 1]
                 )
             else:
@@ -220,7 +230,7 @@ class HGCNResidualEmulsionConv(nn.Module):
         for i, curv in enumerate(curvatures):
             curv = nn.Parameter(curv)
             self.register_parameter("c_{}".format(i), curv)
-            self.curvatures.append(curv)
+            self.curvatures.append(manifolds.Curvature(curv))
         # https://github.com/HazyResearch/hgcn/blob/25a3701f8dfbab2341bc18091fedcb0e9bf61395/models/base_models.py#L27
         hgc_layers = []
         for i in range(len(dims) - 1):
@@ -267,7 +277,7 @@ class HGCNResidualEmulsionConv(nn.Module):
                     c=self.curvatures[i + 1]
                 )
                 x_hyp = self.manifold.proj(
-                    mid_point_poincare(x=x_hyp_new_curv, y=x_new, c=self.curvatures[i + 1], manifold=self.manifold),
+                    self.manifold.mid_point_poincare(x=x_hyp_new_curv, y=x_new, c=self.curvatures[i + 1], manifold=self.manifold),
                     c=self.curvatures[i + 1]
                 )
             else:

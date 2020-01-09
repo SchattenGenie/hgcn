@@ -14,6 +14,20 @@ class DenseAtt(nn.Module):
         self.in_features = in_features
 
     def forward(self, x, adj, edge_attr):
+        att_adj = self.linear(x)
+        att_adj = torch.sigmoid(att_adj)
+        return att_adj
+
+
+class DenseAttDouble(nn.Module):
+    def __init__(self, in_features, dropout, act):
+        super(DenseAtt, self).__init__()
+        self.dropout = dropout
+        self.linear = nn.Linear(in_features, 1, bias=True)
+        self.act = act
+        self.in_features = in_features
+
+    def forward(self, x, adj, edge_attr):
         n = x.size(0)
         # edge_length x d
         x_left = x[adj[0]]
@@ -21,8 +35,9 @@ class DenseAtt(nn.Module):
         x_right = x[adj[1]]
         x_cat = torch.cat((x_left, x_right, edge_attr), dim=1)
         att_adj = self.linear(x_cat)
-        att_adj = F.sigmoid(att_adj)
+        att_adj = torch.sigmoid(att_adj)
         return att_adj
+
 
 
 class SpecialSpmmFunction(torch.autograd.Function):
